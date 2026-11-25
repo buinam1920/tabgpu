@@ -44,8 +44,8 @@ dev = [
 tabgpu = "tabgpu.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/tabgpu/tabgpu"
-Issues = "https://github.com/tabgpu/tabgpu/issues"
+Homepage = "https://github.com/buinam1920/tabgpu"
+Issues = "https://github.com/buinam1920/tabgpu/issues"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
