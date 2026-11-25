@@ -166,6 +166,12 @@ export async function postprocess(outputs, meta) {
     ? await outTensor.getData()
     : outTensor.data;
 
+  if (!rawData || rawData.length < hw) {
+    throw new Error(
+      `Unexpected output tensor size: expected at least ${hw} elements, got ${rawData ? rawData.length : 0}.`,
+    );
+  }
+
   const probs = new Float32Array(hw);
   const mode = meta.postprocess || "min_max";
   const applySigmoid = mode === "sigmoid_min_max" || mode === "sigmoid";

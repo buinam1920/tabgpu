@@ -68,6 +68,7 @@ class CutoutTask:
         mean = meta["mean"]
         std = meta["std"]
         input_name = str(meta["input_name"])
+        output_name = str(meta.get("output_name", ""))
         postprocess = str(meta["postprocess"])
 
         with Image.open(io.BytesIO(payload_bytes)) as img:
@@ -82,14 +83,24 @@ class CutoutTask:
         norm[:, :, 2] = (arr[:, :, 2] - float(mean[2])) / float(std[2])
         tensor = np.expand_dims(norm.transpose((2, 0, 1)), axis=0).astype(np.float32)
 
-        # Resolve input name defensively against actual ONNX session inputs.
         session_inputs = session.get_inputs()
         actual_input = (
             input_name
             if any(inp.name == input_name for inp in session_inputs)
             else session_inputs[0].name
         )
-        outputs = session.run(None, {actual_input: tensor})
+
+        # Match JS behavior: select named output tensor when present, else first output.
+        requested_outputs = None
+        if output_name and hasattr(session, "get_outputs"):
+            try:
+                session_outputs = session.get_outputs()
+                if any(out.name == output_name for out in session_outputs):
+                    requested_outputs = [output_name]
+            except Exception:
+                requested_outputs = None
+
+        outputs = session.run(requested_outputs, {actual_input: tensor})
         mask_u8 = apply_cutout_postprocess(outputs[0], postprocess)
 
         mask_img = Image.fromarray(mask_u8, mode="L")

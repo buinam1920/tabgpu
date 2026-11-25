@@ -166,9 +166,76 @@ def test_source_overwrite_and_output_collision_rejected(tmp_path: Path) -> None:
     with pytest.raises(OutputSafetyError, match="collision"):
         plan_outputs([p1, p2], out_dir, fmt="png", bg="transparent")
 
+    # Case-only collision across dirs (safe on macOS APFS & Linux too)
+    p3 = dir1 / "Photo.jpg"
+    p4 = dir2 / "photo.png"
+    Image.new("RGB", (8, 8), (1, 2, 3)).save(p3)
+    Image.new("RGB", (8, 8), (4, 5, 6)).save(p4)
+    with pytest.raises(OutputSafetyError, match="collision"):
+        plan_outputs([p3, p4], out_dir, fmt="png", bg="transparent")
+
+    # Existing non-input output file refused unless overwrite=True
+    out_dir.mkdir()
+    existing_out = out_dir / "item.png"
+    Image.new("RGB", (8, 8), (9, 9, 9)).save(existing_out)
+    with pytest.raises(OutputSafetyError, match="existing output file"):
+        plan_outputs([p1], out_dir, fmt="png", bg="transparent", overwrite=False)
+    planned_ok = plan_outputs([p1], out_dir, fmt="png", bg="transparent", overwrite=True)
+    assert planned_ok[0][1] == existing_out.resolve()
+
+    # Even with overwrite=True, source files are NEVER overwritten
+    with pytest.raises(OutputSafetyError, match="overwrite source"):
+        plan_outputs([src_a], tmp_path, fmt="png", bg="transparent", overwrite=True)
+
     # JPEG with transparent bg rejected
     with pytest.raises(ValueError, match="cannot preserve --bg transparent"):
         resolve_output_format("jpg", "transparent", p1)
+
+
+def test_worker_payload_strips_icc_and_handles_16bit_grayscale(tmp_path: Path) -> None:
+    from tabgpu.pipeline import encode_clean_rgb_png, load_image_srgb
+
+    # Source with ICC profile -> worker payload must have NO icc_profile chunk
+    srgb_bytes = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+    src_icc = tmp_path / "icc.png"
+    img = Image.new("RGB", (20, 20), (100, 150, 200))
+    img.save(src_icc, format="PNG", icc_profile=srgb_bytes)
+    payload = encode_clean_rgb_png(load_image_srgb(src_icc), (16, 16))
+    with Image.open(io.BytesIO(payload)) as clean_im:
+        assert "icc_profile" not in clean_im.info
+        assert b"iCCP" not in payload
+
+    # 16-bit grayscale (mid-gray 32768) should map near 128, not clip to 255
+    arr16 = np.full((16, 16), 32768, dtype=np.uint16)
+    src_16 = tmp_path / "gray16.png"
+    Image.fromarray(arr16).save(src_16, format="PNG")
+    loaded = load_image_srgb(src_16)
+    assert loaded.mode == "RGB"
+    r, g, b = loaded.getpixel((8, 8))
+    assert 124 <= r <= 132 and r == g == b
+
+
+def test_csv_report_escapes_formula_injection(tmp_path: Path) -> None:
+    in_dir = tmp_path / "in"
+    out_dir = tmp_path / "out"
+    in_dir.mkdir()
+    src = in_dir / "x.png"
+    Image.new("RGB", (8, 8), (1, 2, 3)).save(src)
+
+    task = CutoutTask()
+    spec = _test_model_spec()
+    planned = plan_outputs([src], out_dir, fmt="png", bg="transparent")
+    coord = JobCoordinator(
+        task=task,
+        model_spec=spec,
+        planned_jobs=planned,
+        finalize_options={"bg": "transparent"},
+    )
+    coord.jobs[0].status = "failed"
+    coord.jobs[0].error = "=CMD|' /C calc'!A0"
+    report = out_dir / "report.csv"
+    coord.write_csv_report(report)
+    assert "'=CMD|" in report.read_text(encoding="utf-8")
 
 
 def test_validate_mask_rejects_bad_inputs() -> None:

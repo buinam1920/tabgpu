@@ -507,3 +507,235 @@ def test_lease_expiry_recovery_and_retry_bound(tmp_path: Path) -> None:
         server.server_close()
         thread.join(timeout=3)
 
+
+def test_idle_tcp_client_does_not_freeze_server_or_shutdown(tmp_path: Path) -> None:
+    import socket
+    import time
+
+    server, thread, _coord, _clk, _out, token = _start_test_server(tmp_path, num_images=1)
+    server.handshake_timeout = 1.0
+    port = server.bound_port
+    idle_sock = None
+    try:
+        # Open a raw TCP socket that sends zero bytes (never starts TLS handshake)
+        idle_sock = socket.create_connection(("127.0.0.1", port), timeout=2.0)
+
+        # Real HTTPS request MUST still complete promptly while idle_sock is connected
+        t0 = time.monotonic()
+        status, _, data = _https_req(
+            port,
+            "GET",
+            "/api/config",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        elapsed = time.monotonic() - t0
+        assert status == 200
+        assert json.loads(data)["model_id"] == "fast"
+        assert elapsed < 3.0
+
+        # Server shutdown MUST return promptly even while idle_sock is still open
+        t_sd = time.monotonic()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3.0)
+        assert (time.monotonic() - t_sd) < 3.0
+        assert not thread.is_alive()
+    finally:
+        if idle_sock is not None:
+            idle_sock.close()
+
+
+def test_late_worker_rejected_after_cpu_fallback_and_non_done_fails(tmp_path: Path) -> None:
+    server, thread, coord, _clk, out_dir, token = _start_test_server(tmp_path, num_images=1)
+    port = server.bound_port
+    auth = {"Authorization": f"Bearer {token}"}
+    try:
+        # Before finishing, has_failures() must be True (pending != done)
+        assert coord.has_failures() is True
+
+        class _CpuStub(LocalOrtRunner):
+            def __init__(self) -> None:
+                pass
+
+            def get_session(self):
+                return SimpleNamespace(
+                    get_inputs=lambda: [SimpleNamespace(name="input_image")],
+                    run=lambda _o, _f: [np.ones((1, 1, 16, 16), dtype=np.float32)],
+                )
+
+        coord.run_remaining_on_cpu(_CpuStub())
+        assert coord.is_finished()
+        assert coord.has_failures() is False
+        assert (out_dir / "img_0.png").is_file()
+
+        # Late worker attempting to register after fallback starts receives 410 Gone
+        st, _, _ = _https_req(
+            port,
+            "POST",
+            "/api/register",
+            headers={**auth, "Content-Type": "application/json"},
+            body=json.dumps({"adapter_name": "LateGPU", "provider": "webgpu"}).encode(),
+        )
+        assert st == 410
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_unreadable_input_returns_422_and_worker_finishes_remaining_jobs(tmp_path: Path) -> None:
+    in_dir = tmp_path / "inputs"
+    out_dir = tmp_path / "outputs"
+    in_dir.mkdir()
+    bad_src = in_dir / "01_corrupt.png"
+    good_src = in_dir / "02_good.png"
+    bad_src.write_bytes(b"definitely not an image")
+    Image.new("RGB", (24, 24), (20, 120, 220)).save(good_src)
+
+    model_path = tmp_path / "fake.onnx"
+    model_path.write_bytes(b"FAKEONNX")
+    spec = _fake_model_spec()
+    task = CutoutTask(models={"fast": spec})
+    planned = plan_outputs([bad_src, good_src], out_dir, fmt="png", bg="transparent")
+    coord = JobCoordinator(
+        task=task,
+        model_spec=spec,
+        planned_jobs=planned,
+        finalize_options={"bg": "transparent", "feather": 0.0},
+    )
+    tls_mat = ensure_tls_cert(tmp_path / "certs", ["127.0.0.1"])
+    token = "secret-422-token"
+    server = TabGpuHTTPSServer(
+        bind_host="127.0.0.1",
+        port=0,
+        advertised_host="127.0.0.1",
+        cert_path=tls_mat.cert_path,
+        key_path=tls_mat.key_path,
+        token=token,
+        coordinator=coord,
+        asset_manager=AssetManager(cache_dir=tmp_path / "cache"),
+        model_spec=spec,
+        model_path=model_path,
+    )
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+    thread.start()
+    port = server.bound_port
+    auth = {"Authorization": f"Bearer {token}"}
+    try:
+        st, _, data = _https_req(
+            port, "POST", "/api/register",
+            headers={**auth, "Content-Type": "application/json"},
+            body=json.dumps({"adapter_name": "GPU", "provider": "webgpu"}).encode(),
+        )
+        assert st == 200
+        wid = json.loads(data)["worker_id"]
+
+        # Lease job 1 (corrupt) -> GET input returns 422 with skip=True and marks only job 1 failed
+        st, _, data = _https_req(
+            port, "POST", "/api/jobs/next",
+            headers={**auth, "Content-Type": "application/json"},
+            body=json.dumps({"worker_id": wid}).encode(),
+        )
+        j1 = json.loads(data)
+        st, _, err_data = _https_req(
+            port, "GET", j1["input_url"],
+            headers={**auth, "X-Worker-Id": wid, "X-Lease-Id": j1["lease_id"]},
+        )
+        assert st == 422
+        err_json = json.loads(err_data)
+        assert err_json["skip"] is True
+        assert str(bad_src) not in err_data.decode()
+
+        # Worker continues to lease and complete job 2 (good)
+        st, _, data = _https_req(
+            port, "POST", "/api/jobs/next",
+            headers={**auth, "Content-Type": "application/json"},
+            body=json.dumps({"worker_id": wid}).encode(),
+        )
+        j2 = json.loads(data)
+        assert j2["status"] == "job"
+        st, _, _ = _https_req(
+            port, "GET", j2["input_url"],
+            headers={**auth, "X-Worker-Id": wid, "X-Lease-Id": j2["lease_id"]},
+        )
+        assert st == 200
+        st, _, _ = _https_req(
+            port, "POST", j2["result_url"],
+            headers={**auth, "X-Worker-Id": wid, "X-Lease-Id": j2["lease_id"]},
+            body=_grayscale_png(16, 16, 255),
+        )
+        assert st == 200
+        assert (out_dir / "02_good.png").is_file()
+        assert coord.counts() == {"pending": 0, "leased": 0, "done": 1, "failed": 1}
+        assert coord.has_failures() is True
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_heartbeat_lease_ceiling_non_ascii_auth_desync_and_no_unauth_ort_download(tmp_path: Path) -> None:
+    clk = _MutableClock(3000.0)
+    server, thread, coord, _, _out, token = _start_test_server(
+        tmp_path, num_images=1, lease_seconds=10.0, clock=clk
+    )
+    coord.max_lease_age_seconds = 25.0
+    port = server.bound_port
+    auth = {"Authorization": f"Bearer {token}"}
+    try:
+        # Uncached ORT vendor file returns 404 without triggering outbound downloads
+        st, _, _ = _https_req(port, "GET", "/vendor/ort/ort-wasm-simd-threaded.asyncify.wasm")
+        assert st == 404
+
+        # Non-ASCII Bearer header returns 403 cleanly (no TypeError crash) and sets Connection: close
+        st, hdrs, _ = _https_req(
+            port, "GET", "/api/config", headers={"Authorization": "Bearer caf\u00e9"}
+        )
+        assert st == 403
+        assert hdrs.get("connection", "").lower() == "close"
+
+        # Rejected POST with unconsumed body closes connection (prevents keep-alive desync)
+        st, hdrs, _ = _https_req(
+            port,
+            "POST",
+            "/api/jobs/job-0001/result",
+            headers={**auth},  # missing X-Worker-Id / X-Lease-Id -> 400 before reading body
+            body=b"GET /api/config HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        )
+        assert st == 400
+        assert hdrs.get("connection", "").lower() == "close"
+
+        # Heartbeat cannot extend a hung lease past max_lease_age_seconds (25s)
+        st, _, data = _https_req(
+            port, "POST", "/api/register",
+            headers={**auth, "Content-Type": "application/json"},
+            body=json.dumps({"adapter_name": "GPU", "provider": "webgpu"}).encode(),
+        )
+        assert st == 200
+        wid = json.loads(data)["worker_id"]
+        st, _, _ = _https_req(
+            port, "POST", "/api/jobs/next",
+            headers={**auth, "Content-Type": "application/json"},
+            body=json.dumps({"worker_id": wid}).encode(),
+        )
+        assert st == 200
+
+        # Heartbeat repeatedly past 25s ceiling
+        for _ in range(4):
+            clk.advance(8.0)
+            st, _, _ = _https_req(
+                port, "POST", "/api/heartbeat",
+                headers={**auth, "Content-Type": "application/json"},
+                body=json.dumps({"worker_id": wid}).encode(),
+            )
+            assert st == 200
+
+        # At t=3032 (> 3000 + 25), lease must be reclaimed despite active heartbeats
+        assert coord.reclaim_expired_leases() == 1
+        assert coord.jobs[0].status == "pending"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+

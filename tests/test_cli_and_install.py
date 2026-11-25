@@ -121,3 +121,20 @@ def test_cutout_cli_cpu_bench_and_nonzero_on_failed_job(tmp_path: Path, monkeypa
     assert ",failed,cpu," in report_text
 
 
+def test_ipv6_bind_rejected_cleanly(tmp_path: Path, capsys) -> None:
+    rc_doc = main(["doctor", "--bind", "::1", "--port", "0", "--cache-dir", str(tmp_path)])
+    err_doc = capsys.readouterr().err
+    assert rc_doc == 2
+    assert "IPv6" in err_doc
+
+    img = tmp_path / "a.png"
+    from PIL import Image
+
+    Image.new("RGB", (8, 8), (1, 2, 3)).save(img)
+    rc_cut = main(["cutout", str(img), "-o", str(tmp_path / "out"), "--bind", "::1", "--mode", "auto"])
+    err_cut = capsys.readouterr().err
+    assert rc_cut == 2
+    assert "IPv6" in err_cut
+
+
+

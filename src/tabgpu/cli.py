@@ -28,6 +28,7 @@ from tabgpu.server import (
     detect_lan_ip,
     generate_session_token,
     list_lan_ipv4_addresses,
+    validate_ipv4_bind_address,
 )
 from tabgpu.tasks import TASKS
 from tabgpu.tls import TLSError, ensure_tls_cert
@@ -51,7 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Inspect LAN interfaces, port availability, local onnxruntime, cache, and firewall hints.",
     )
     doc.add_argument("--port", type=int, default=8787, help="Port to check (default: 8787).")
-    doc.add_argument("--bind", type=str, default=None, help="Specific bind IP to test.")
+    doc.add_argument("--bind", type=str, default=None, help="Specific IPv4 bind address to test.")
     doc.add_argument("--cache-dir", type=Path, default=None, help="Override host cache directory.")
 
     # --- cutout ---
@@ -102,14 +103,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional Gaussian feather radius in pixels for mask edges (default: 0).",
     )
     cut.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Allow overwriting existing non-source files in the output directory.",
+    )
+    cut.add_argument(
         "--bind",
         default=None,
-        help="Network interface IP to bind (defaults to detected LAN IP, not 0.0.0.0).",
+        help="IPv4 network interface address to bind (defaults to detected LAN IP, not 0.0.0.0).",
     )
     cut.add_argument(
         "--host",
         default=None,
-        help="Advertised IP or hostname for pairing URL and TLS SAN.",
+        help="Advertised IPv4 address or hostname for pairing URL and TLS SAN.",
     )
     cut.add_argument(
         "--port",
@@ -188,7 +194,6 @@ def run_doctor(args: argparse.Namespace) -> int:
     print("=" * 40)
     print(f"Python:   {sys.version.split()[0]} ({platform.system()} {platform.release()})")
 
-    # Check local onnxruntime
     try:
         import onnxruntime as ort
 
@@ -197,8 +202,12 @@ def run_doctor(args: argparse.Namespace) -> int:
     except Exception as exc:
         print(f"ORT CPU:  UNAVAILABLE ({exc})")
 
-    # Check LAN interfaces & port
-    preferred_ip = args.bind or detect_lan_ip()
+    try:
+        preferred_ip = validate_ipv4_bind_address(args.bind) if args.bind else detect_lan_ip()
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
     lan_ips = list_lan_ipv4_addresses()
     print(f"LAN IP:   {preferred_ip} (detected interfaces: {', '.join(lan_ips) or 'loopback only'})")
 
@@ -206,7 +215,6 @@ def run_doctor(args: argparse.Namespace) -> int:
     status_str = "OK (available)" if port_ok else f"BUSY/BLOCKED ({port_msg})"
     print(f"Port:     {preferred_ip}:{args.port} -> {status_str}")
 
-    # Check cache status
     assets = AssetManager(cache_dir=args.cache_dir)
     status = assets.cache_status()
     print(f"Cache:    {status['cache_dir']}")
@@ -214,9 +222,9 @@ def run_doctor(args: argparse.Namespace) -> int:
     for mid, st in status["models"].items():
         spec = assets.manifest.models[mid]
         print(f"  - {mid:<8} ({spec.filename}): {st}")
-    cached_ort = sum(1 for v in status["ort_files"].values() if v == "cached_ok")
-    total_ort = len(status["ort_files"])
-    print(f"ORT-Web:  v{status['ort_version']} ({cached_ort}/{total_ort} pinned files cached)")
+    req_cached = status["ort_required_cached"]
+    req_total = status["ort_required_total"]
+    print(f"ORT-Web:  v{status['ort_version']} ({req_cached}/{req_total} required WebGPU runtime files cached)")
 
     _print_firewall_hints(args.port)
     return 0 if port_ok else 1
@@ -245,21 +253,22 @@ def _print_bench(coordinator: JobCoordinator, model_id: str, ort_version: str) -
 
 
 def run_cutout(args: argparse.Namespace) -> int:
-    # Validate CLI options early before downloading models or opening sockets.
     try:
         parse_bg_color(args.bg)
         if args.feather < 0:
             raise ValueError("--feather must be >= 0")
+        if args.bind is not None:
+            validate_ipv4_bind_address(args.bind)
         sources = discover_inputs(args.inputs)
         if not sources:
             raise ValueError("No supported input images found.")
-        # Validate format/bg compatibility immediately.
         resolve_output_format(args.output_format, args.bg, sources[0])
         planned = plan_outputs(
             sources,
             args.output,
             fmt=args.output_format,
             bg=args.bg,
+            overwrite=args.overwrite,
         )
     except (ValueError, FileNotFoundError, OutputSafetyError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -273,7 +282,8 @@ def run_cutout(args: argparse.Namespace) -> int:
         print(f"Preparing model '{model_spec.id}' ({model_spec.display_name})...")
         model_path = assets.ensure_model(model_spec.id)
         if args.mode in ("auto", "lan"):
-            assets.ensure_ort_entry()
+            print(f"Ensuring pinned onnxruntime-web v{assets.manifest.ort_version} runtime...")
+            assets.ensure_ort_runtime()
     except (UnknownAssetError, AssetIntegrityError, OSError) as exc:
         print(f"Asset error: {exc}", file=sys.stderr)
         return 1
@@ -302,12 +312,16 @@ def run_cutout(args: argparse.Namespace) -> int:
     report_path = args.report or (args.output.resolve() / "tabgpu_report.csv")
 
     if args.mode == "cpu":
-        coordinator.run_remaining_on_cpu(cpu_runner)
+        try:
+            coordinator.run_remaining_on_cpu(cpu_runner)
+        except KeyboardInterrupt:
+            print("\nInterrupted by user; writing partial report...", file=sys.stderr)
+            coordinator.mark_remaining_failed("interrupted by user")
     else:
-        bind_ip = args.bind or detect_lan_ip()
-        advertised_host = args.host or (detect_lan_ip() if bind_ip in ("0.0.0.0", "::") else bind_ip)
+        bind_ip = validate_ipv4_bind_address(args.bind) if args.bind else detect_lan_ip()
+        advertised_host = args.host or (detect_lan_ip() if bind_ip == "0.0.0.0" else bind_ip)
         san_hosts = [advertised_host]
-        if bind_ip not in ("0.0.0.0", "::") and bind_ip not in san_hosts:
+        if bind_ip != "0.0.0.0" and bind_ip not in san_hosts:
             san_hosts.append(bind_ip)
 
         try:
@@ -330,7 +344,7 @@ def run_cutout(args: argparse.Namespace) -> int:
                 model_spec=model_spec,
                 model_path=model_path,
             )
-        except (TLSError, OSError) as exc:
+        except (TLSError, ValueError, OSError) as exc:
             print(f"Server startup error: {exc}", file=sys.stderr)
             return 1
 
@@ -360,6 +374,7 @@ def run_cutout(args: argparse.Namespace) -> int:
             print("\nInterrupted by user; shutting down cleanly...", file=sys.stderr)
             coordinator.mark_remaining_failed("interrupted by user")
         finally:
+            coordinator.close_to_workers()
             server.shutdown()
             server.server_close()
             server_thread.join(timeout=3.0)

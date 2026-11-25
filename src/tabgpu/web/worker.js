@@ -45,27 +45,70 @@ function setStatus(text, variant = "") {
   els.statusPill.className = variant ? `pill ${variant}` : "pill";
 }
 
-function isLikelyIntegratedOrSoftwareGpu(name) {
-  const lower = (name || "").toLowerCase();
-  if (!lower || lower === "unknown" || lower.includes("unavailable")) return true;
-  const patterns = [
-    "intel",
-    "uhd graphics",
-    "iris",
-    "microsoft basic",
-    "swiftshader",
-    "llvmpipe",
-    "software",
-    "radeon(tm) graphics",
-    "vega 8",
-    "vega 7",
-    "vega 6",
-    "apple m",
-  ];
-  // Apple Silicon unified GPUs are fast; don't flag them as weak integrated GPUs.
-  if (lower.includes("apple")) return false;
-  if (lower.includes("arc a") || lower.includes("arc b")) return false;
-  return patterns.some((p) => lower.includes(p));
+function formatAdapterName(info) {
+  const rawParts = [info?.description, info?.vendor, info?.architecture, info?.device]
+    .map((s) => (s || "").trim())
+    .filter(Boolean);
+  const unique = [];
+  for (const part of rawParts) {
+    if (!unique.some((u) => u.toLowerCase().includes(part.toLowerCase()))) {
+      unique.push(part);
+    }
+  }
+  return unique.length > 0 ? unique.join(" / ") : "WebGPU Adapter";
+}
+
+function isLikelyIntegratedOrSoftwareGpu(info) {
+  const vendor = (info?.vendor || "").toLowerCase();
+  const arch = (info?.architecture || "").toLowerCase();
+  const desc = (info?.description || "").toLowerCase();
+  const device = (info?.device || "").toLowerCase();
+  const combined = `${vendor} ${arch} ${desc} ${device}`.trim();
+
+  if (!combined || combined === "unknown") return true;
+
+  // Software / fallback renderers
+  const softwarePatterns = ["swiftshader", "llvmpipe", "microsoft basic", "software", "warp"];
+  if (softwarePatterns.some((p) => combined.includes(p))) return true;
+
+  // Discrete NVIDIA and Apple Silicon unified GPUs are high-performance
+  if (vendor.includes("nvidia") || desc.includes("nvidia") || desc.includes("geforce") || desc.includes("rtx")) {
+    return false;
+  }
+  if (vendor.includes("apple") || desc.includes("apple")) {
+    return false;
+  }
+
+  // Intel: discrete Arc vs integrated UHD/Iris/Gen/Xe-LP
+  if (vendor.includes("intel") || desc.includes("intel")) {
+    const discreteIntel = ["arc a", "arc b", "xe-hpg", "xe2-hpg", "alchemist", "battlemage"];
+    if (discreteIntel.some((p) => combined.includes(p))) return false;
+    return true;
+  }
+
+  // AMD: distinguish integrated APU graphics from discrete Radeon RX / Navi dGPUs
+  if (vendor.includes("amd") || vendor.includes("ati") || desc.includes("radeon")) {
+    const discreteAmd = ["rx ", "radeon pro", "navi", "rdna-3", "rdna-4", "7900", "7800", "7700", "7600", "6900", "6800", "6700", "6600"];
+    if (discreteAmd.some((p) => combined.includes(p))) return false;
+    const integratedAmd = [
+      "radeon(tm) graphics",
+      "radeon graphics",
+      "vega",
+      "renoir",
+      "cezanne",
+      "rembrandt",
+      "phoenix",
+      "hawk",
+      "strix",
+      "raphael",
+      "van gogh",
+      "gcn",
+      "integrated",
+    ];
+    if (integratedAmd.some((p) => combined.includes(p))) return true;
+  }
+
+  return false;
 }
 
 async function detectGpuAdapter() {
@@ -91,11 +134,10 @@ async function detectGpuAdapter() {
     }
 
     const info = adapter.info || (adapter.requestAdapterInfo ? await adapter.requestAdapterInfo() : {});
-    const parts = [info.description, info.device, info.vendor, info.architecture].filter(Boolean);
-    const adapterName = parts.length > 0 ? parts[0] : "WebGPU Adapter";
+    const adapterName = formatAdapterName(info);
     els.gpuAdapter.textContent = adapterName;
 
-    if (isLikelyIntegratedOrSoftwareGpu(adapterName)) {
+    if (isLikelyIntegratedOrSoftwareGpu(info)) {
       els.gpuWarning.innerHTML =
         `<strong>Integrated/software GPU detected (${escapeHtml(adapterName)}):</strong> ` +
         "On Windows multi-GPU laptops, Windows may assign Chrome to the integrated GPU by default. " +
@@ -188,6 +230,25 @@ document.addEventListener("visibilitychange", () => {
   }
 });
 
+// Release worker session immediately if the user reloads or closes the tab.
+window.addEventListener("pagehide", () => {
+  if (!currentWorkerId || !authToken) return;
+  const wid = currentWorkerId;
+  currentWorkerId = null;
+  try {
+    fetch("/api/disconnect", {
+      method: "POST",
+      keepalive: true,
+      headers: authHeaders({ "Content-Type": "application/json", "X-Worker-Id": wid }),
+      body: JSON.stringify({ worker_id: wid, reason: "pagehide" }),
+      cache: "no-store",
+      credentials: "omit",
+    }).catch(() => {});
+  } catch (_) {
+    // Ignore unload errors.
+  }
+});
+
 async function sendDisconnect(reason) {
   if (!currentWorkerId || !authToken) return;
   const wid = currentWorkerId;
@@ -233,11 +294,20 @@ async function fetchLeasedJob(workerId, signal) {
     },
     signal,
   });
+  if (imgResp.status === 422) {
+    let counts = data.counts;
+    try {
+      const errBody = await imgResp.json();
+      if (errBody?.counts) counts = errBody.counts;
+    } catch (_) {}
+    log(`Skipped unreadable host input ${data.job_id}; continuing batch.`);
+    return { status: "skip", jobId: data.job_id, counts };
+  }
   if (!imgResp.ok) {
     throw new Error(`Input fetch failed for ${data.job_id} (HTTP ${imgResp.status})`);
   }
   const blob = await imgResp.blob();
-  const bitmap = await createImageBitmap(blob);
+  const bitmap = await createImageBitmap(blob, { colorSpaceConversion: "none" });
   return {
     status: "job",
     jobId: data.job_id,
@@ -278,6 +348,7 @@ async function runWorker() {
   let prefetchedJob = null;
   let disconnectReason = "client_disconnect";
   let modelBuffer = null;
+  let modelBytes = null;
 
   try {
     await acquireWakeLock();
@@ -301,7 +372,9 @@ async function runWorker() {
       throw new Error("onnxruntime-web failed to load from /vendor/ort/ort.webgpu.min.js.");
     }
     ort.env.wasm.wasmPaths = "/vendor/ort/";
-    ort.env.wasm.proxy = false;
+    if (ort.env.webgpu) {
+      ort.env.webgpu.powerPreference = "high-performance";
+    }
 
     const initialProvider = gpuProbe.available ? "webgpu" : "wasm";
     const regResp = await apiFetch("/api/register", {
@@ -316,6 +389,9 @@ async function runWorker() {
     });
     if (regResp.status === 409) {
       throw new Error("Another GPU worker tab is already active on this host.");
+    }
+    if (regResp.status === 410) {
+      throw new Error("Host already switched to CPU fallback or finished this batch.");
     }
     if (!regResp.ok) {
       throw new Error(`Worker registration failed (HTTP ${regResp.status})`);
@@ -348,14 +424,15 @@ async function runWorker() {
     const modelFetchMs = performance.now() - tFetch0;
     log(`Model loaded into RAM in ${modelFetchMs.toFixed(0)} ms.`);
 
-    // Create ONNX Runtime session (prefer WebGPU, fall back to WASM with warning).
+    // Create ONNX Runtime session (prefer WebGPU, fall back to WASM with proxy worker so heartbeats keep firing).
     setStatus("Compiling WebGPU session…");
     const tCompile0 = performance.now();
     let activeProvider = "webgpu";
-    const modelBytes = new Uint8Array(modelBuffer);
+    modelBytes = new Uint8Array(modelBuffer);
 
     if (gpuProbe.available) {
       try {
+        ort.env.wasm.proxy = false;
         activeSession = await ort.InferenceSession.create(modelBytes, {
           executionProviders: ["webgpu"],
           graphOptimizationLevel: "all",
@@ -366,18 +443,21 @@ async function runWorker() {
         els.gpuWarning.textContent =
           `Warning: WebGPU session failed (${webgpuErr.message || webgpuErr}). Running on WASM CPU fallback.`;
         els.gpuWarning.classList.remove("hidden");
+        ort.env.wasm.proxy = true;
         activeSession = await ort.InferenceSession.create(modelBytes, {
           executionProviders: ["wasm"],
         });
       }
     } else {
       activeProvider = "wasm";
+      ort.env.wasm.proxy = true;
       activeSession = await ort.InferenceSession.create(modelBytes, {
         executionProviders: ["wasm"],
       });
     }
 
-    // Release raw ArrayBuffer reference immediately once ORT has initialized.
+    // Drop both references immediately so the 178-224 MB model buffer is eligible for GC.
+    modelBytes = null;
     modelBuffer = null;
 
     const sessionCompileMs = performance.now() - tCompile0;
@@ -410,6 +490,11 @@ async function runWorker() {
         disconnectReason = "completed";
         log("All jobs completed.");
         break;
+      }
+
+      if (currentJob.status === "skip") {
+        currentJob = await fetchLeasedJob(currentWorkerId, abortController.signal);
+        continue;
       }
 
       if (currentJob.status === "wait") {
@@ -525,13 +610,10 @@ async function runWorker() {
       heartbeatTimer = null;
     }
 
-    // Wait for any in-flight GPU inference promise to settle before releasing the session.
     if (inFlightInference) {
       try {
         await inFlightInference;
-      } catch (_) {
-        // Ignore settled error during teardown.
-      }
+      } catch (_) {}
       inFlightInference = null;
     }
 
@@ -551,6 +633,7 @@ async function runWorker() {
       } catch (_) {}
       activeSession = null;
     }
+    modelBytes = null;
     modelBuffer = null;
 
     await sendDisconnect(disconnectReason);

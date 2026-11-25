@@ -17,6 +17,13 @@ from platformdirs import user_cache_dir
 
 _CHUNK_SIZE = 1024 * 1024  # 1 MiB
 
+# Files actively fetched by ort.webgpu.min.js@1.31.1 at runtime in Chrome.
+REQUIRED_ORT_WEBGPU_FILES: tuple[str, ...] = (
+    "ort.webgpu.min.js",
+    "ort-wasm-simd-threaded.asyncify.mjs",
+    "ort-wasm-simd-threaded.asyncify.wasm",
+)
+
 
 class AssetIntegrityError(RuntimeError):
     """Raised when an asset fails SHA-256 verification."""
@@ -185,6 +192,8 @@ class AssetManager:
         self._downloader = downloader or _default_downloader
         self._locks_guard = threading.Lock()
         self._file_locks: dict[Path, threading.Lock] = {}
+        # Process-local stat cache avoiding redundant 29MB re-hashing on every HTTP GET.
+        self._verified_stats: dict[Path, tuple[int, int, str]] = {}
 
     @property
     def models_dir(self) -> Path:
@@ -205,6 +214,18 @@ class AssetManager:
                 lock = threading.Lock()
                 self._file_locks[path] = lock
             return lock
+
+    def _is_verified_stat(self, path: Path, expected_sha256: str) -> bool:
+        try:
+            st = path.stat()
+        except OSError:
+            return False
+        cached = self._verified_stats.get(path)
+        return cached == (st.st_mtime_ns, st.st_size, expected_sha256.lower())
+
+    def _record_verified_stat(self, path: Path, expected_sha256: str) -> None:
+        st = path.stat()
+        self._verified_stats[path] = (st.st_mtime_ns, st.st_size, expected_sha256.lower())
 
     def get_model_spec(self, model_id: str) -> ModelSpec:
         if model_id not in self.manifest.models:
@@ -246,9 +267,38 @@ class AssetManager:
         )
         return path, spec
 
+    def ensure_ort_runtime(self) -> list[Path]:
+        """Prefetch and verify all onnxruntime-web files required for WebGPU inference."""
+        paths: list[Path] = []
+        for fname in REQUIRED_ORT_WEBGPU_FILES:
+            if fname in self.manifest.ort_files:
+                p, _ = self.ensure_ort_file(fname)
+                paths.append(p)
+        return paths
+
     def ensure_ort_entry(self) -> Path:
         path, _ = self.ensure_ort_file("ort.webgpu.min.js")
         return path
+
+    def get_cached_ort_file(self, filename: str) -> tuple[Path, OrtAssetSpec]:
+        """Return a verified, already-cached ORT file without triggering outbound downloads."""
+        spec = self.get_ort_spec(filename)
+        dest = self.ort_dir / spec.filename
+        if self._is_verified_stat(dest, spec.sha256):
+            return dest, spec
+        lock = self._lock_for(dest)
+        with lock:
+            if self._is_verified_stat(dest, spec.sha256):
+                return dest, spec
+            if not dest.is_file():
+                raise FileNotFoundError(f"onnxruntime-web file {filename!r} is not cached")
+            actual = compute_sha256(dest)
+            if actual != spec.sha256.lower():
+                raise AssetIntegrityError(
+                    f"Cached onnxruntime-web {filename} failed SHA-256 verification."
+                )
+            self._record_verified_stat(dest, spec.sha256)
+            return dest, spec
 
     def cache_status(self) -> dict[str, Any]:
         """Inspect current cache state without downloading anything."""
@@ -272,11 +322,16 @@ class AssetManager:
             else:
                 ort_status[fname] = "checksum_mismatch"
 
+        req_cached = sum(
+            1 for f in REQUIRED_ORT_WEBGPU_FILES if ort_status.get(f) == "cached_ok"
+        )
         return {
             "cache_dir": str(self.cache_dir),
             "ort_version": self.manifest.ort_version,
             "models": models_status,
             "ort_files": ort_status,
+            "ort_required_cached": req_cached,
+            "ort_required_total": len(REQUIRED_ORT_WEBGPU_FILES),
         }
 
     def _ensure_file(
@@ -288,13 +343,20 @@ class AssetManager:
         label: str,
     ) -> Path:
         expected = expected_sha256.lower()
+        if self._is_verified_stat(dest, expected):
+            return dest
+
         dest.parent.mkdir(parents=True, exist_ok=True)
         lock = self._lock_for(dest)
 
         with lock:
+            if self._is_verified_stat(dest, expected):
+                return dest
+
             if dest.is_file():
                 actual = compute_sha256(dest)
                 if actual == expected:
+                    self._record_verified_stat(dest, expected)
                     return dest
                 raise AssetIntegrityError(
                     f"Cached {label} at {dest} failed SHA-256 check "
@@ -313,6 +375,7 @@ class AssetManager:
                         f"(expected {expected}, got {actual.lower()})."
                     )
                 os.replace(part_path, dest)
+                self._record_verified_stat(dest, expected)
                 return dest
             except Exception:
                 try:

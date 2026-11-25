@@ -18,12 +18,14 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from tabgpu.assets import AssetManager, ModelSpec, UnknownAssetError
+from tabgpu.assets import AssetIntegrityError, AssetManager, ModelSpec, UnknownAssetError
 from tabgpu.pipeline import (
     InvalidMaskError,
     JobCoordinator,
+    PrepareFailedError,
     StaleLeaseError,
     UnknownJobError,
+    WorkerClosedError,
     WorkerConflictError,
 )
 from tabgpu.tls import create_ssl_context
@@ -31,7 +33,36 @@ from tabgpu.tls import create_ssl_context
 MAX_JSON_BODY_BYTES = 64 * 1024  # 64 KiB
 DEFAULT_MAX_RESULT_BODY_BYTES = 16 * 1024 * 1024  # 16 MiB
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 30.0
+DEFAULT_HANDSHAKE_TIMEOUT_SECONDS = 10.0
 _FORBIDDEN_QUERY_PARAMS = {"token", "auth", "access_token", "bearer", "key"}
+_MAX_TRACKED_RATE_LIMIT_IPS = 1024
+
+
+def validate_ipv4_bind_address(bind_host: str) -> str:
+    """Validate that `--bind` is an IPv4 address (v0.1 binds AF_INET only)."""
+    cleaned = bind_host.strip()
+    try:
+        addr = ipaddress.ip_address(cleaned)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid --bind IP address {bind_host!r}: expected an IPv4 address (e.g. 192.168.1.23)."
+        ) from exc
+    if addr.version != 4:
+        raise ValueError(
+            f"IPv6 bind address {bind_host!r} is not supported in v0.1; please supply an IPv4 LAN address."
+        )
+    return str(addr)
+
+
+def _format_host_for_url(host: str) -> str:
+    h = host.strip().lower()
+    try:
+        addr = ipaddress.ip_address(h)
+        if addr.version == 6:
+            return f"[{addr}]"
+        return str(addr)
+    except ValueError:
+        return h
 
 
 def detect_lan_ip() -> str:
@@ -85,22 +116,41 @@ def check_port_available(bind_ip: str, port: int) -> tuple[bool, str]:
 
 
 class AuthRateLimiter:
-    """Sliding-window per-IP rate limiter for invalid authentication attempts."""
+    """Bounded-memory sliding-window per-IP rate limiter for invalid auth attempts."""
 
     def __init__(
         self,
         *,
         max_failures: int = 5,
         window_seconds: float = 60.0,
+        max_tracked_ips: int = _MAX_TRACKED_RATE_LIMIT_IPS,
         clock=time.monotonic,
     ) -> None:
         self.max_failures = int(max_failures)
         self.window_seconds = float(window_seconds)
+        self.max_tracked_ips = int(max_tracked_ips)
         self._clock = clock
         self._lock = threading.Lock()
         self._failures: dict[str, deque[float]] = {}
 
+    def _evict_expired_locked(self, now: float) -> None:
+        cutoff = now - self.window_seconds
+        empty_keys: list[str] = []
+        for ip, dq in self._failures.items():
+            while dq and dq[0] <= cutoff:
+                dq.popleft()
+            if not dq:
+                empty_keys.append(ip)
+        for ip in empty_keys:
+            del self._failures[ip]
+        # Hard cap on dict size
+        while len(self._failures) > self.max_tracked_ips:
+            oldest_ip = next(iter(self._failures))
+            del self._failures[oldest_ip]
+
     def _prune_locked(self, ip: str, now: float) -> deque[float]:
+        if len(self._failures) >= self.max_tracked_ips:
+            self._evict_expired_locked(now)
         dq = self._failures.get(ip)
         if dq is None:
             dq = deque()
@@ -113,7 +163,15 @@ class AuthRateLimiter:
     def is_blocked(self, ip: str) -> tuple[bool, int]:
         with self._lock:
             now = self._clock()
-            dq = self._prune_locked(ip, now)
+            dq = self._failures.get(ip)
+            if dq is None:
+                return False, 0
+            cutoff = now - self.window_seconds
+            while dq and dq[0] <= cutoff:
+                dq.popleft()
+            if not dq:
+                del self._failures[ip]
+                return False, 0
             if len(dq) >= self.max_failures:
                 retry_after = max(1, int(self.window_seconds - (now - dq[0])) + 1)
                 return True, retry_after
@@ -139,7 +197,12 @@ def _load_web_text(rel_path: str) -> bytes:
 
 
 class TabGpuHTTPSServer(ThreadingHTTPServer):
-    """Hardened temporary HTTPS server backing the Chrome WebGPU worker."""
+    """Hardened temporary HTTPS server backing the Chrome WebGPU worker.
+
+    Accepts raw TCP sockets on the accept loop and performs per-connection TLS
+    handshakes inside worker threads with a strict handshake timeout so an idle
+    TCP client can never block the server or stall shutdown.
+    """
 
     allow_reuse_address = True
     daemon_threads = True
@@ -159,18 +222,21 @@ class TabGpuHTTPSServer(ThreadingHTTPServer):
         model_path: Path,
         max_result_body_bytes: int = DEFAULT_MAX_RESULT_BODY_BYTES,
         request_timeout: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        handshake_timeout: float = DEFAULT_HANDSHAKE_TIMEOUT_SECONDS,
         rate_limit_max_failures: int = 5,
         rate_limit_window_seconds: float = 60.0,
     ) -> None:
-        self.bind_host = bind_host
-        self.advertised_host = advertised_host
+        self.bind_host = validate_ipv4_bind_address(bind_host)
+        self.advertised_host = advertised_host.strip()
         self.token = token
+        self._token_bytes = token.encode("utf-8")
         self.coordinator = coordinator
         self.asset_manager = asset_manager
         self.model_spec = model_spec
         self.model_path = model_path
         self.max_result_body_bytes = int(max_result_body_bytes)
         self.request_timeout = float(request_timeout)
+        self.handshake_timeout = float(handshake_timeout)
         self.rate_limiter = AuthRateLimiter(
             max_failures=rate_limit_max_failures,
             window_seconds=rate_limit_window_seconds,
@@ -183,17 +249,17 @@ class TabGpuHTTPSServer(ThreadingHTTPServer):
                 "application/javascript; charset=utf-8",
             ),
         }
+        self._ssl_context = create_ssl_context(cert_path, key_path)
 
-        super().__init__((bind_host, port), _TabGpuRequestHandler)
+        # Keep listening socket as plain TCP; TLS wrap happens per-thread in handler.setup().
+        super().__init__((self.bind_host, port), _TabGpuRequestHandler)
         self.bound_port: int = int(self.server_address[1])
         self.allowed_hosts, self.allowed_origins = self._compute_allowed_origins()
-        self._ssl_context = create_ssl_context(cert_path, key_path)
-        self.socket = self._ssl_context.wrap_socket(self.socket, server_side=True)
 
     def _compute_allowed_origins(self) -> tuple[set[str], set[str]]:
-        raw_hosts = {self.advertised_host.lower()}
-        if self.bind_host not in ("0.0.0.0", "::"):
-            raw_hosts.add(self.bind_host.lower())
+        raw_hosts = {_format_host_for_url(self.advertised_host)}
+        if self.bind_host != "0.0.0.0":
+            raw_hosts.add(_format_host_for_url(self.bind_host))
 
         hosts: set[str] = set()
         origins: set[str] = set()
@@ -208,18 +274,22 @@ class TabGpuHTTPSServer(ThreadingHTTPServer):
 
     @property
     def worker_url(self) -> str:
-        return f"https://{self.advertised_host}:{self.bound_port}/#{self.token}"
+        host_fmt = _format_host_for_url(self.advertised_host)
+        return f"https://{host_fmt}:{self.bound_port}/#{self.token}"
 
     @property
     def base_url(self) -> str:
-        return f"https://{self.advertised_host}:{self.bound_port}"
+        host_fmt = _format_host_for_url(self.advertised_host)
+        return f"https://{host_fmt}:{self.bound_port}"
 
     def handle_error(self, request: Any, client_address: Any) -> None:
-        # Suppress noisy tracebacks from self-signed TLS probe resets or client aborts.
         import sys
 
         _, exc, _ = sys.exc_info()
-        if isinstance(exc, (ssl.SSLError, ConnectionResetError, BrokenPipeError, TimeoutError, OSError)):
+        if isinstance(
+            exc,
+            (ssl.SSLError, ConnectionResetError, BrokenPipeError, TimeoutError, OSError),
+        ):
             return
         super().handle_error(request, client_address)
 
@@ -229,11 +299,41 @@ class _TabGpuRequestHandler(BaseHTTPRequestHandler):
     server: TabGpuHTTPSServer
 
     def setup(self) -> None:
+        # Perform TLS handshake inside the per-connection handler thread with a strict timeout.
+        self._tls_sock = None
+        self.request.settimeout(self.server.handshake_timeout)
+        tls_sock = self.server._ssl_context.wrap_socket(
+            self.request,
+            server_side=True,
+            do_handshake_on_connect=False,
+        )
+        try:
+            tls_sock.do_handshake()
+        except Exception:
+            try:
+                tls_sock.close()
+            except OSError:
+                pass
+            raise
+        self._tls_sock = tls_sock
+        self.request = tls_sock
+        self.request.settimeout(self.server.request_timeout)
         super().setup()
-        self.connection.settimeout(self.server.request_timeout)
+
+    def finish(self) -> None:
+        try:
+            super().finish()
+        except (ssl.SSLError, OSError):
+            pass
+        finally:
+            tls_sock = getattr(self, "_tls_sock", None)
+            if tls_sock is not None:
+                try:
+                    tls_sock.close()
+                except OSError:
+                    pass
 
     def log_message(self, format: str, *args: Any) -> None:
-        # Quiet by default; host CLI prints structured progress.
         return
 
     # ------------------------------------------------------------------
@@ -279,10 +379,18 @@ class _TabGpuRequestHandler(BaseHTTPRequestHandler):
         clear_site_data: bool = False,
         extra_headers: dict[str, str] | None = None,
     ) -> None:
+        # Close connection on any error response so unconsumed POST bodies cannot cause
+        # HTTP/1.1 keep-alive request desynchronization.
+        force_close = int(status) >= 400
+        if force_close:
+            self.close_connection = True
+
         self.send_response(status)
         self._send_security_headers(is_html=is_html, clear_site_data=clear_site_data)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        if force_close:
+            self.send_header("Connection", "close")
         if extra_headers:
             for k, v in extra_headers.items():
                 self.send_header(k, v)
@@ -396,8 +504,8 @@ class _TabGpuRequestHandler(BaseHTTPRequestHandler):
             )
             return False
 
-        supplied = parts[1].strip()
-        if not hmac.compare_digest(supplied, self.server.token):
+        supplied_bytes = parts[1].strip().encode("utf-8", errors="surrogateescape")
+        if not hmac.compare_digest(supplied_bytes, self.server._token_bytes):
             blocked, retry_after = self.server.rate_limiter.record_failure(client_ip)
             if blocked:
                 self._send_json(
@@ -444,16 +552,31 @@ class _TabGpuRequestHandler(BaseHTTPRequestHandler):
                     "detail": f"Request body exceeds limit of {max_bytes} bytes.",
                 },
             )
-            self.close_connection = True
             return None
 
         if length == 0:
             return b""
 
+        deadline = time.monotonic() + self.server.request_timeout
         chunks: list[bytes] = []
         remaining = length
         while remaining > 0:
-            chunk = self.rfile.read(min(remaining, 65536))
+            left = deadline - time.monotonic()
+            if left <= 0:
+                self._send_json(
+                    HTTPStatus.REQUEST_TIMEOUT,
+                    {"error": "request_timeout", "detail": "Request body transfer timed out."},
+                )
+                return None
+            self.connection.settimeout(left)
+            try:
+                chunk = self.rfile.read(min(remaining, 65536))
+            except TimeoutError:
+                self._send_json(
+                    HTTPStatus.REQUEST_TIMEOUT,
+                    {"error": "request_timeout", "detail": "Request body transfer timed out."},
+                )
+                return None
             if not chunk:
                 self._send_json(
                     HTTPStatus.BAD_REQUEST,
@@ -462,6 +585,7 @@ class _TabGpuRequestHandler(BaseHTTPRequestHandler):
                 return None
             chunks.append(chunk)
             remaining -= len(chunk)
+        self.connection.settimeout(self.server.request_timeout)
         return b"".join(chunks)
 
     def _read_json_body(self) -> dict[str, Any] | None:
@@ -501,21 +625,21 @@ class _TabGpuRequestHandler(BaseHTTPRequestHandler):
             self._send_bytes(HTTPStatus.OK, content, ctype, is_html=(path == "/"))
             return
 
-        # Pinned onnxruntime-web vendor files (strictly allowlisted by manifest).
+        # Serve ONLY prefetched/cached allowlisted ORT files (never trigger outbound downloads).
         if path.startswith("/vendor/ort/"):
             fname = unquote(path[len("/vendor/ort/") :])
             if "/" in fname or "\\" in fname or ".." in fname:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
                 return
             try:
-                file_path, spec = self.server.asset_manager.ensure_ort_file(fname)
-            except UnknownAssetError:
+                file_path, spec = self.server.asset_manager.get_cached_ort_file(fname)
+            except (UnknownAssetError, FileNotFoundError):
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
                 return
-            except Exception as exc:
+            except AssetIntegrityError:
                 self._send_json(
-                    HTTPStatus.BAD_GATEWAY,
-                    {"error": "asset_unavailable", "detail": str(exc)},
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {"error": "asset_integrity_error", "detail": "Runtime asset failed integrity verification."},
                 )
                 return
             self._stream_file(file_path, spec.content_type)
@@ -562,13 +686,23 @@ class _TabGpuRequestHandler(BaseHTTPRequestHandler):
             except UnknownJobError:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_job"})
                 return
-            except StaleLeaseError as exc:
-                self._send_json(HTTPStatus.CONFLICT, {"error": "stale_lease", "detail": str(exc)})
+            except StaleLeaseError:
+                self._send_json(HTTPStatus.CONFLICT, {"error": "stale_lease"})
                 return
-            except Exception as exc:
+            except PrepareFailedError:
+                self._send_json(
+                    HTTPStatus.UNPROCESSABLE_ENTITY,
+                    {
+                        "error": "prepare_failed",
+                        "skip": True,
+                        "counts": self.server.coordinator.counts(),
+                    },
+                )
+                return
+            except Exception:
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
-                    {"error": "prepare_failed", "detail": str(exc)},
+                    {"error": "prepare_failed"},
                 )
                 return
             self._send_bytes(HTTPStatus.OK, data, "image/png")
@@ -595,10 +729,16 @@ class _TabGpuRequestHandler(BaseHTTPRequestHandler):
                     webgpu_available=bool(body.get("webgpu_available", False)),
                     user_agent=str(self.headers.get("User-Agent", "")),
                 )
-            except WorkerConflictError as exc:
+            except WorkerClosedError:
+                self._send_json(
+                    HTTPStatus.GONE,
+                    {"error": "worker_closed", "detail": "Host is no longer accepting LAN workers."},
+                )
+                return
+            except WorkerConflictError:
                 self._send_json(
                     HTTPStatus.CONFLICT,
-                    {"error": "worker_conflict", "detail": str(exc)},
+                    {"error": "worker_conflict", "detail": "Another GPU worker session is already active."},
                 )
                 return
             self._send_json(
@@ -624,8 +764,8 @@ class _TabGpuRequestHandler(BaseHTTPRequestHandler):
                     provider=body.get("provider"),
                     adapter_name=body.get("adapter_name"),
                 )
-            except StaleLeaseError as exc:
-                self._send_json(HTTPStatus.CONFLICT, {"error": "stale_worker", "detail": str(exc)})
+            except StaleLeaseError:
+                self._send_json(HTTPStatus.CONFLICT, {"error": "stale_worker"})
                 return
             self._send_json(HTTPStatus.OK, {"status": "ok"})
             return
@@ -637,8 +777,8 @@ class _TabGpuRequestHandler(BaseHTTPRequestHandler):
             worker_id = str(body.get("worker_id") or self.headers.get("X-Worker-Id") or "").strip()
             try:
                 self.server.coordinator.heartbeat(worker_id)
-            except StaleLeaseError as exc:
-                self._send_json(HTTPStatus.CONFLICT, {"error": "stale_worker", "detail": str(exc)})
+            except StaleLeaseError:
+                self._send_json(HTTPStatus.CONFLICT, {"error": "stale_worker"})
                 return
             self._send_json(HTTPStatus.OK, {"status": "ok", "counts": self.server.coordinator.counts()})
             return
@@ -650,8 +790,8 @@ class _TabGpuRequestHandler(BaseHTTPRequestHandler):
             worker_id = str(body.get("worker_id") or self.headers.get("X-Worker-Id") or "").strip()
             try:
                 status, job_info = self.server.coordinator.lease_next(worker_id)
-            except StaleLeaseError as exc:
-                self._send_json(HTTPStatus.CONFLICT, {"error": "stale_worker", "detail": str(exc)})
+            except StaleLeaseError:
+                self._send_json(HTTPStatus.CONFLICT, {"error": "stale_worker"})
                 return
             resp: dict[str, Any] = {"status": status, "counts": self.server.coordinator.counts()}
             if job_info is not None:
@@ -693,16 +833,16 @@ class _TabGpuRequestHandler(BaseHTTPRequestHandler):
             except UnknownJobError:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_job"})
                 return
-            except StaleLeaseError as exc:
-                self._send_json(HTTPStatus.CONFLICT, {"error": "stale_lease", "detail": str(exc)})
+            except StaleLeaseError:
+                self._send_json(HTTPStatus.CONFLICT, {"error": "stale_lease"})
                 return
             except InvalidMaskError as exc:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_mask", "detail": str(exc)})
                 return
-            except Exception as exc:
+            except Exception:
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
-                    {"error": "finalize_failed", "detail": str(exc)},
+                    {"error": "finalize_failed"},
                 )
                 return
 
@@ -730,8 +870,8 @@ class _TabGpuRequestHandler(BaseHTTPRequestHandler):
             except UnknownJobError:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_job"})
                 return
-            except StaleLeaseError as exc:
-                self._send_json(HTTPStatus.CONFLICT, {"error": "stale_lease", "detail": str(exc)})
+            except StaleLeaseError:
+                self._send_json(HTTPStatus.CONFLICT, {"error": "stale_lease"})
                 return
             self._send_json(HTTPStatus.OK, {"status": "recorded"})
             return

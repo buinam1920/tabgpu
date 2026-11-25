@@ -11,6 +11,7 @@ import secrets
 import struct
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Literal
@@ -31,10 +32,11 @@ SUPPORTED_INPUT_EXTS = {
 _HEX_COLOR_RE = re.compile(r"^#([0-9a-fA-F]{6})$")
 _PNG_SIG = b"\x89PNG\r\n\x1a\n"
 _SRGB_PROFILE = ImageCms.createProfile("sRGB")
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 
 
 class OutputSafetyError(ValueError):
-    """Raised when an output path would overwrite a source file or collide with another output."""
+    """Raised when an output path would overwrite a source/existing file or collide."""
 
 
 class InvalidMaskError(ValueError):
@@ -45,12 +47,32 @@ class WorkerConflictError(RuntimeError):
     """Raised when a second worker tries to register while an active worker holds the session."""
 
 
+class WorkerClosedError(RuntimeError):
+    """Raised when the host is no longer accepting LAN workers (CPU fallback or shutdown)."""
+
+
 class StaleLeaseError(RuntimeError):
     """Raised when a worker references an expired, unknown, or superseded lease_id."""
 
 
+class PrepareFailedError(RuntimeError):
+    """Raised when a source image cannot be decoded or prepared (job marked failed)."""
+
+
 class UnknownJobError(KeyError):
     """Raised when a worker references an unknown job_id."""
+
+
+def _collision_key(path: Path) -> str:
+    """Case- and Unicode-normalization-insensitive key (safe across Windows, macOS APFS, Linux)."""
+    return unicodedata.normalize("NFC", str(path.resolve())).casefold()
+
+
+def _sanitize_csv_cell(value: str) -> str:
+    """Prevent spreadsheet formula injection in untrusted/path CSV cells."""
+    if value and value[0] in _CSV_FORMULA_PREFIXES:
+        return "'" + value
+    return value
 
 
 def parse_bg_color(bg: str) -> tuple[int, int, int] | None:
@@ -132,28 +154,48 @@ def plan_outputs(
     *,
     fmt: str = "auto",
     bg: str = "transparent",
+    overwrite: bool = False,
 ) -> list[tuple[Path, Path, Literal["png", "jpg", "webp"]]]:
-    """Map source files to output paths, rejecting source overwrites and output collisions."""
+    """Map source files to output paths, rejecting source overwrites, collisions, and existing files."""
     if not sources:
         raise ValueError("No input images found.")
 
     out_dir_resolved = out_dir.resolve()
-    src_keys = {os.path.normcase(str(s.resolve())) for s in sources}
+    src_keys = {_collision_key(s) for s in sources}
     seen_out: dict[str, Path] = {}
     planned: list[tuple[Path, Path, Literal["png", "jpg", "webp"]]] = []
 
     for src in sources:
         resolved_fmt = resolve_output_format(fmt, bg, src)
         out_path = out_dir_resolved / f"{src.stem}.{resolved_fmt}"
-        out_key = os.path.normcase(str(out_path.resolve()))
-        if out_key in src_keys:
+        out_key = _collision_key(out_path)
+
+        # Always refuse to overwrite a source file (handles case-insensitive APFS, NFC/NFD, symlinks).
+        same_as_source = out_key in src_keys
+        if not same_as_source and out_path.exists():
+            for existing_src in sources:
+                try:
+                    if existing_src.exists() and os.path.samefile(out_path, existing_src):
+                        same_as_source = True
+                        break
+                except OSError:
+                    continue
+        if same_as_source:
             raise OutputSafetyError(
                 f"Refusing to overwrite source file: output {out_path} matches an input file."
             )
+
         if out_key in seen_out:
             raise OutputSafetyError(
                 f"Output path collision: {seen_out[out_key]} and {src} both map to {out_path}."
             )
+
+        if not overwrite and out_path.exists():
+            raise OutputSafetyError(
+                f"Refusing to overwrite existing output file {out_path}. "
+                "Pass --overwrite to replace existing files."
+            )
+
         seen_out[out_key] = src
         planned.append((src, out_path, resolved_fmt))
 
@@ -161,7 +203,7 @@ def plan_outputs(
 
 
 def load_image_srgb(path: Path) -> Image.Image:
-    """Load an image, apply EXIF orientation, and convert embedded ICC profiles to sRGB.
+    """Load an image, apply EXIF orientation, normalize 16-bit modes, and convert ICC to sRGB.
 
     Returns an RGBA image if the source had transparency, otherwise RGB.
     """
@@ -172,6 +214,15 @@ def load_image_srgb(path: Path) -> Image.Image:
             img = raw_img.copy()
         else:
             img.load()
+
+        # Normalize 16-bit integer grayscale modes without clipping to 255.
+        if img.mode.startswith("I;16") or img.mode == "I":
+            arr = np.asarray(img, dtype=np.float32)
+            if img.mode.startswith("I;16") or float(np.max(arr)) > 255.0:
+                scaled = np.clip(np.rint(arr / 257.0), 0.0, 255.0).astype(np.uint8)
+            else:
+                scaled = np.clip(np.rint(arr), 0.0, 255.0).astype(np.uint8)
+            img = Image.fromarray(scaled, mode="L")
 
         has_alpha = img.mode in ("RGBA", "LA", "PA") or (
             img.mode == "P" and "transparency" in img.info
@@ -214,12 +265,14 @@ def _convert_rgb_icc_to_srgb(rgb: Image.Image, icc_bytes: bytes | None) -> Image
 
 
 def encode_clean_rgb_png(img: Image.Image, size: tuple[int, int]) -> bytes:
-    """Resize an sRGB image and encode an EXIF/metadata-free RGB PNG for worker transfer."""
+    """Resize an sRGB image and encode an EXIF- and ICC-free RGB PNG for worker transfer."""
     rgb = img.convert("RGB")
     if rgb.size != size:
         rgb = rgb.resize(size, Image.Resampling.LANCZOS)
+    # Build a clean image from raw pixels so Pillow drops any carried iCCP/EXIF metadata.
+    clean = Image.frombytes("RGB", rgb.size, rgb.tobytes())
     buf = io.BytesIO()
-    rgb.save(buf, format="PNG", optimize=False)
+    clean.save(buf, format="PNG", optimize=False, icc_profile=None)
     return buf.getvalue()
 
 
@@ -371,7 +424,7 @@ def atomic_save_image(
     """Encode an image with stripped EXIF/metadata and write it atomically."""
     buf = io.BytesIO()
     if fmt == "png":
-        img.save(buf, format="PNG")
+        img.save(buf, format="PNG", icc_profile=None)
     elif fmt == "jpg":
         rgb = img.convert("RGB")
         rgb.save(buf, format="JPEG", quality=92, subsampling=0)
@@ -461,6 +514,7 @@ class JobCoordinator:
         planned_jobs: list[tuple[Path, Path, Literal["png", "jpg", "webp"]]],
         finalize_options: dict[str, Any],
         lease_seconds: float = 45.0,
+        max_lease_age_seconds: float | None = None,
         worker_timeout_seconds: float = 20.0,
         max_retries: int = 2,
         max_in_flight_per_worker: int = 2,
@@ -471,6 +525,11 @@ class JobCoordinator:
         self.model_spec = model_spec
         self.finalize_options = dict(finalize_options)
         self.lease_seconds = float(lease_seconds)
+        self.max_lease_age_seconds = (
+            float(max_lease_age_seconds)
+            if max_lease_age_seconds is not None
+            else max(self.lease_seconds * 4.0, 180.0)
+        )
         self.worker_timeout_seconds = float(worker_timeout_seconds)
         self.max_retries = int(max_retries)
         self.max_in_flight_per_worker = int(max_in_flight_per_worker)
@@ -478,6 +537,7 @@ class JobCoordinator:
         self._on_progress = on_progress
 
         self._lock = threading.RLock()
+        self._accepting_workers = True
         self.jobs: list[JobRecord] = []
         self._jobs_by_id: dict[str, JobRecord] = {}
         for idx, (src, out, fmt) in enumerate(planned_jobs, start=1):
@@ -513,19 +573,55 @@ class JobCoordinator:
             return all(j.status in ("done", "failed") for j in self.jobs)
 
     def has_failures(self) -> bool:
+        """Return True if any job failed OR failed to reach terminal 'done' state."""
         with self._lock:
-            return any(j.status == "failed" for j in self.jobs)
+            return any(j.status != "done" for j in self.jobs)
 
     def _check_all_done_locked(self) -> None:
         if all(j.status in ("done", "failed") for j in self.jobs):
             self.all_done_event.set()
+
+    def _effective_worker_timeout_locked(self, worker: WorkerState) -> float:
+        if worker.provider.lower() == "wasm":
+            return max(self.worker_timeout_seconds, 90.0)
+        return self.worker_timeout_seconds
 
     def is_worker_alive(self) -> bool:
         with self._lock:
             w = self.active_worker
             if w is None or w.disconnected or w.fatal_error is not None:
                 return False
-            return (self._clock() - w.last_seen) <= self.worker_timeout_seconds
+            timeout = self._effective_worker_timeout_locked(w)
+            return (self._clock() - w.last_seen) <= timeout
+
+    def close_to_workers(self, wait_committing_seconds: float = 10.0) -> None:
+        """Stop accepting LAN workers, wait for in-flight commits, and reclaim unfinished leases."""
+        with self._lock:
+            self._accepting_workers = False
+            if self.active_worker is not None:
+                self.active_worker.disconnected = True
+                self.worker_disconnected_event.set()
+
+        # Wait briefly for any mid-finalize commit to finish its atomic disk replace.
+        deadline = time.monotonic() + max(0.0, wait_committing_seconds)
+        while time.monotonic() < deadline:
+            with self._lock:
+                if not any(j.committing for j in self.jobs):
+                    break
+            time.sleep(0.05)
+
+        with self._lock:
+            if self.active_worker is not None:
+                self._release_worker_leases_locked(
+                    self.active_worker.worker_id, count_attempt=False
+                )
+            for job in self.jobs:
+                if job.status == "leased" and not job.committing:
+                    self._return_job_to_pending_or_fail_locked(
+                        job,
+                        error="released for host CPU fallback",
+                        count_attempt=False,
+                    )
 
     def register_worker(
         self,
@@ -536,18 +632,24 @@ class JobCoordinator:
         user_agent: str = "",
     ) -> WorkerState:
         with self._lock:
+            if not self._accepting_workers:
+                raise WorkerClosedError(
+                    "Host is no longer accepting LAN workers (CPU fallback or shutdown in progress)."
+                )
             now = self._clock()
             self.reclaim_expired_leases()
             if self.active_worker is not None:
+                timeout = self._effective_worker_timeout_locked(self.active_worker)
                 alive = (
                     not self.active_worker.disconnected
                     and self.active_worker.fatal_error is None
-                    and (now - self.active_worker.last_seen) <= self.worker_timeout_seconds
+                    and (now - self.active_worker.last_seen) <= timeout
                 )
                 if alive:
                     raise WorkerConflictError("Another GPU worker session is already active.")
-                # Previous worker is stale/disconnected; release its unfinished leases.
-                self._release_worker_leases_locked(self.active_worker.worker_id, count_attempt=False)
+                self._release_worker_leases_locked(
+                    self.active_worker.worker_id, count_attempt=False
+                )
 
             worker = WorkerState(
                 worker_id=secrets.token_urlsafe(12),
@@ -596,16 +698,18 @@ class JobCoordinator:
             now = self._clock()
             worker.last_seen = now
             for job in self.jobs:
-                if job.status == "leased" and job.leased_to == worker_id:
-                    job.lease_expires_at = now + self.lease_seconds
+                if job.status == "leased" and job.leased_to == worker_id and not job.committing:
+                    leased_at = job.leased_at if job.leased_at is not None else now
+                    ceiling = leased_at + self.max_lease_age_seconds
+                    job.lease_expires_at = min(now + self.lease_seconds, ceiling)
 
     def disconnect_worker(self, worker_id: str, reason: str = "client_disconnect") -> None:
         with self._lock:
             if self.active_worker is None or self.active_worker.worker_id != worker_id:
                 return
             self.active_worker.disconnected = True
-            if reason != "completed":
-                self._release_worker_leases_locked(worker_id, count_attempt=False)
+            # Always release any unfinished non-committing leases back to pending.
+            self._release_worker_leases_locked(worker_id, count_attempt=False)
             self.worker_disconnected_event.set()
 
     def _require_active_worker_locked(self, worker_id: str) -> WorkerState:
@@ -663,7 +767,8 @@ class JobCoordinator:
             if (
                 self.active_worker is not None
                 and not self.active_worker.disconnected
-                and (now - self.active_worker.last_seen) > self.worker_timeout_seconds
+                and (now - self.active_worker.last_seen)
+                > self._effective_worker_timeout_locked(self.active_worker)
             ):
                 self.active_worker.disconnected = True
                 self.worker_disconnected_event.set()
@@ -689,6 +794,8 @@ class JobCoordinator:
     def lease_next(self, worker_id: str) -> tuple[str, dict[str, Any] | None]:
         """Lease the next pending job for `worker_id` (supporting prefetch up to max_in_flight)."""
         with self._lock:
+            if not self._accepting_workers:
+                return "done", None
             worker = self._require_active_worker_locked(worker_id)
             now = self._clock()
             worker.last_seen = now
@@ -737,9 +844,29 @@ class JobCoordinator:
             src_path = job.src_path
 
         t0 = self._clock()
-        payload, meta = self.task.prepare(src_path, self.model_spec)
-        prep_ms = (self._clock() - t0) * 1000.0
+        try:
+            payload, meta = self.task.prepare(src_path, self.model_spec)
+        except Exception as exc:
+            # Mark unreadable input permanently failed so one bad image never kills the worker.
+            with self._lock:
+                if job.status == "leased" and job.lease_id == lease_id:
+                    job.attempts += 1
+                    job.status = "failed"
+                    job.worker_type = (
+                        self.active_worker.provider if self.active_worker else "host"
+                    )
+                    job.lease_id = None
+                    job.leased_to = None
+                    job.lease_expires_at = None
+                    job.error = f"prepare failed: {exc}"
+                    job._prepared_bytes = None
+                    job._prepared_meta = None
+                    self._check_all_done_locked()
+                    if self._on_progress:
+                        self._on_progress(job)
+            raise PrepareFailedError(f"Failed to prepare input image: {exc}") from exc
 
+        prep_ms = (self._clock() - t0) * 1000.0
         with self._lock:
             if job.status == "leased" and job.lease_id == lease_id:
                 job._prepared_bytes = payload
@@ -762,7 +889,6 @@ class JobCoordinator:
             if job is None:
                 raise UnknownJobError(job_id)
 
-            # Idempotent duplicate commit for the exact lease that completed this job.
             if job.status == "done":
                 if job.committed_lease_id == lease_id:
                     return "already_committed"
@@ -798,7 +924,6 @@ class JobCoordinator:
             job.committing = True
 
         try:
-            # Validate mask format and exact expected dimensions BEFORE touching disk.
             self.task.validate_result(result_bytes, meta)
 
             t_fin = self._clock()
@@ -853,8 +978,6 @@ class JobCoordinator:
             if fatal and self.active_worker and self.active_worker.worker_id == worker_id:
                 self.active_worker.fatal_error = error
                 self.active_worker.disconnected = True
-                # Do not penalize job retry count for a fatal WebGPU initialization/device loss
-                # so host CPU fallback can cleanly process it.
                 self._return_job_to_pending_or_fail_locked(
                     job, error=error, count_attempt=False
                 )
@@ -866,15 +989,8 @@ class JobCoordinator:
                 )
 
     def run_remaining_on_cpu(self, cpu_runner: LocalOrtRunner) -> None:
-        """Take over any remaining pending/reclaimed jobs and run them on host CPU."""
-        # Release any disconnected/stale leases first
-        with self._lock:
-            if self.active_worker is not None:
-                self._release_worker_leases_locked(
-                    self.active_worker.worker_id, count_attempt=False
-                )
-                self.active_worker.disconnected = True
-            self.reclaim_expired_leases()
+        """Close LAN worker registration, wait for in-flight commits, and finish all jobs on CPU."""
+        self.close_to_workers()
 
         session: Any = None
         while True:
@@ -943,7 +1059,8 @@ class JobCoordinator:
                         self._on_progress(next_job)
 
     def mark_remaining_failed(self, reason: str) -> None:
-        """Mark any unfinished jobs as failed (e.g. --mode lan timeout)."""
+        """Close worker acceptance, wait for active commits, and mark unfinished jobs failed."""
+        self.close_to_workers()
         with self._lock:
             for job in self.jobs:
                 if job.status in ("pending", "leased"):
@@ -956,7 +1073,7 @@ class JobCoordinator:
             self._check_all_done_locked()
 
     def write_csv_report(self, report_path: Path) -> None:
-        """Write a deterministic per-file CSV report atomically."""
+        """Write a deterministic per-file CSV report atomically (with formula escaping)."""
         buf = io.StringIO()
         writer = csv.writer(buf, lineterminator="\n")
         writer.writerow(
@@ -979,16 +1096,16 @@ class JobCoordinator:
                 writer.writerow(
                     [
                         job.job_id,
-                        str(job.src_path),
-                        str(job.out_path),
+                        _sanitize_csv_cell(str(job.src_path)),
+                        _sanitize_csv_cell(str(job.out_path)),
                         job.status,
-                        job.worker_type,
+                        _sanitize_csv_cell(job.worker_type),
                         job.attempts,
                         f"{job.prepare_ms:.1f}" if job.prepare_ms is not None else "",
                         f"{job.inference_ms:.1f}" if job.inference_ms is not None else "",
                         f"{job.round_trip_ms:.1f}" if job.round_trip_ms is not None else "",
                         f"{job.finalize_ms:.1f}" if job.finalize_ms is not None else "",
-                        job.error,
+                        _sanitize_csv_cell(job.error),
                     ]
                 )
         atomic_write_bytes(report_path, buf.getvalue().encode("utf-8"))
@@ -997,8 +1114,6 @@ class JobCoordinator:
         """Compute separated cold-start and warm per-image p50/p95 timing statistics."""
         with self._lock:
             done_jobs = [j for j in self.jobs if j.status == "done"]
-            # Warm timings exclude the very first job when >= 2 jobs exist so cold-start
-            # JIT/shader warmup does not skew steady-state p50/p95.
             lan_jobs = [j for j in done_jobs if j.worker_type != "cpu"]
             warm_pool = lan_jobs[1:] if len(lan_jobs) >= 2 else done_jobs
             rt_vals = sorted(

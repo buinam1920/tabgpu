@@ -17,9 +17,9 @@ Borrow a faster laptop's GPU on your trusted LAN using **nothing but a Chrome ta
 
 2. **Start a batch cutout job on the host PC:**
    ```bash
-   tabgpu cutout ./photos/*.jpg -o ./cutouts --bg transparent --model balanced
+   tabgpu cutout ./photos -o ./cutouts --bg transparent --model balanced
    ```
-   `tabgpu` binds a temporary local HTTPS server on your LAN IP and prints a short pairing URL (e.g., `https://192.168.1.23:8787/#<token>`) plus the certificate's SHA-256 fingerprint.
+   `tabgpu` binds a temporary local HTTPS server on your LAN IPv4 interface and prints a short pairing URL (e.g., `https://192.168.1.23:8787/#<token>`) plus the certificate's SHA-256 fingerprint.
 
 3. **Open that URL in Chrome (Incognito recommended) on your GPU laptop:**
    Accept the one-time self-signed certificate warning, verify the detected GPU adapter name, and click **Start GPU Worker**. When the batch completes (or you click **Stop**), the tab releases all WebGPU buffers and displays **"Released — safe to close tab"**. If you skip this step, `--mode auto` waits `--wait-seconds` and finishes the batch on your host CPU automatically.
@@ -31,7 +31,7 @@ Borrow a faster laptop's GPU on your trusted LAN using **nothing but a Chrome ta
 ```mermaid
 flowchart LR
     subgraph Host["Host PC (Python CLI)"]
-        IN["Full-Res Originals<br/>(EXIF + ICC -> sRGB)"] --> PREP["Task.prepare()<br/>Strip EXIF + Resize"]
+        IN["Full-Res Originals<br/>(EXIF + ICC -> sRGB)"] --> PREP["Task.prepare()<br/>Strip EXIF/ICC + Resize"]
         PREP --> SRV["Temp LAN HTTPS Server<br/>Bearer Auth + Leases"]
         SRV --> FIN["Task.finalize()<br/>Full-Res Composite + Atomic Write"]
         FIN --> OUT["Outputs + CSV Report"]
@@ -54,16 +54,24 @@ flowchart LR
 # Check LAN interfaces, port availability, local onnxruntime, and OS firewall hints
 tabgpu doctor
 
-# Batch background removal
+# Batch background removal (pass a directory or explicit file paths)
 tabgpu cutout ./input_dir -o ./out_dir \
-  --model balanced \       # fast (u2netp 320px) | balanced (isnet 1024px) | best (birefnet-lite 1024px)
-  --mode auto \            # auto (LAN then CPU fallback) | lan | cpu
-  --bg transparent \       # transparent | white | #RRGGBB
-  --format auto \          # auto | png | jpg | webp
-  --feather 0 \            # optional mask feather radius in pixels
-  --wait-seconds 60 \      # seconds to wait for a LAN worker in auto/lan mode
-  --bench                  # print cold-start vs warm p50/p95 timing breakdown
+  --model balanced \
+  --mode auto \
+  --bg transparent \
+  --format auto \
+  --feather 0 \
+  --wait-seconds 60 \
+  --bench
 ```
+
+Key options:
+- `--model`: `fast` (`u2netp` 320px), `balanced` (`isnet-general-use` 1024px, default), or `best` (`BiRefNet_lite` 1024px)
+- `--mode`: `auto` (wait for LAN worker then finish on host CPU), `lan`, or `cpu`
+- `--bg`: `transparent`, `white`, or `#RRGGBB`
+- `--format`: `auto`, `png`, `jpg`, or `webp`
+- `--overwrite`: allow replacing existing non-source files in `-o` (source files are never overwritten)
+- `--bench`: print cold-start vs warm p50/p95 round-trip timing breakdown
 
 ---
 
@@ -91,20 +99,20 @@ Run `tabgpu cutout ... --bench` to report **cold-start** overhead separately fro
 `tabgpu` is designed for **no install, nothing written by the app, and model/job buffers held in memory only** on the GPU laptop. It does **not** claim "zero trace", because browsers and operating systems have their own low-level subsystems outside any web page's control.
 
 ### What `tabgpu` enforces
-- **Trusted LAN binding:** Binds to the chosen LAN interface by default (not `0.0.0.0` unless explicitly requested with `--bind 0.0.0.0`).
+- **Trusted LAN binding:** Binds to the chosen IPv4 LAN interface by default (not `0.0.0.0` unless explicitly requested with `--bind 0.0.0.0`).
 - **Local HTTPS with exact SANs:** Auto-generates a self-signed certificate with matching IP/DNS Subject Alternative Names (or accepts your own `--cert`/`--key`) so Chrome enables `navigator.gpu` WebGPU.
-- **Fragment-only pairing token:** The per-run secret token is passed only in `#<token>`, cleared immediately via `history.replaceState`, and sent strictly in `Authorization: Bearer <token>` headers (never in query strings).
-- **Request hardening:** Validates `Host` and same-origin `Origin`, rate-limits invalid auth attempts, bounds request sizes and socket timeouts, and validates uploaded mask PNG format + exact dimensions before decoding.
-- **Data minimization:** The worker receives only opaque job IDs and EXIF-stripped, pre-resized pixel buffers — never original filenames, directory paths, EXIF metadata, or full-resolution originals.
-- **No app-managed persistence:** All HTTP responses send `Cache-Control: no-store, no-cache, must-revalidate, max-age=0`, `Pragma: no-cache`, `Cross-Origin-Opener-Policy: same-origin`, and `Cross-Origin-Embedder-Policy: require-corp`. `/api/disconnect` also sends `Clear-Site-Data: "cache", "storage"`. The web worker never uses `IndexedDB`, `localStorage`, `sessionStorage`, `CacheStorage`, cookies, or file downloads.
-- **Pinned integrity:** All `.onnx` models and `onnxruntime-web` assets are verified against pinned SHA-256 checksums on download (`.part` → verify → atomic rename) and on cache reuse.
+- **Fragment-only pairing token:** The per-run secret token is passed only in `#<token>`, scrubbed from the address bar via `history.replaceState` on page load, and sent strictly in `Authorization: Bearer <token>` headers (never in query strings).
+- **Request hardening:** Validates `Host` and same-origin `Origin`, rate-limits invalid auth attempts, runs per-connection TLS handshakes off the accept thread with bounded handshake/body timeouts and body size limits, closes connections on error responses, and validates uploaded 8-bit 1-channel PNG masks (signature, IHDR, exact dimensions) before decoding.
+- **Data minimization:** The worker receives only opaque job IDs and EXIF/ICC-stripped, pre-resized sRGB pixel buffers — never original filenames, directory paths, EXIF metadata, or full-resolution originals.
+- **No app-managed persistence:** All HTTP responses send `Cache-Control: no-store, no-cache, must-revalidate, max-age=0`, `Pragma: no-cache`, `Cross-Origin-Opener-Policy: same-origin`, and `Cross-Origin-Embedder-Policy: require-corp` (with a strict document CSP on `/`). `/api/disconnect` also sends `Clear-Site-Data: "cache", "storage"`. The web worker never uses `IndexedDB`, `localStorage`, `sessionStorage`, `CacheStorage`, cookies, or file downloads.
+- **Pinned integrity:** All `.onnx` models and required `onnxruntime-web` runtime files are prefetched and verified on the host against pinned SHA-256 checksums (`.part` → verify → atomic rename) before serving.
 
 ### What the browser or OS may still touch (even with `no-store`)
 
 | Surface | Why it happens | Mitigation |
 | :--- | :--- | :--- |
 | **TLS certificate exception** | Accepting a self-signed warning in a regular Chrome profile saves a temporary exception in that profile. | Use **Chrome Incognito** (recommended) or supply a LAN CA-trusted `--cert`/`--key`. |
-| **Browser history & autocomplete** | Regular profiles record visited host URLs (the `#<token>` fragment is stripped on load, but the host/port remains). | Use **Chrome Incognito**. |
+| **Browser history & autocomplete** | Regular profiles record the initially navigated URL (including `#<token>`) before JS runs `history.replaceState`. | Use **Chrome Incognito**; tokens are single-run and expire when the CLI exits. |
 | **GPU / Dawn shader cache** | Chrome and GPU drivers cache compiled WebGPU/WGSL shaders on disk for performance. | OS/driver behavior; contains compiled shaders, not your image data. |
 | **OS pagefile / swap / crash dumps** | Under memory pressure or a browser crash, the OS may page RAM to disk or write a crash minidump. | Standard OS behavior; click **Stop** to release tensors/sessions promptly. |
 | **Trusted-LAN assumption** | Self-signed TLS protects against passive eavesdropping, but first-use acceptance assumes a trusted local network. | Verify the printed SHA-256 cert fingerprint; **never** expose `tabgpu` to the public internet. |
@@ -114,6 +122,7 @@ Run `tabgpu cutout ... --bench` to report **cold-start** overhead separately fro
 ## Non-Goals & Limitations (v0.1)
 
 - **No WAN / internet exposure**, NAT traversal, tunneling, or WebRTC.
+- **No IPv6 binding** in v0.1 (IPv4 LAN only).
 - **No user accounts**, multi-host clusters, multi-worker concurrency, or simultaneous hybrid CPU+GPU scheduling (v0.1 uses one active LAN worker at a time, with host CPU fallback).
 - **No host web dashboard**, Docker wrapper, Electron app, model zoo, or model training.
 - **No worker-side model caching** (`IndexedDB`, `localStorage`, `CacheStorage`, cookies, or downloads) — each fresh tab fetches the model over the LAN into RAM/VRAM.
