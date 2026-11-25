@@ -1,0 +1,127 @@
+{
+  "schema_version": 1,
+  "ort_web": {
+    "package": "onnxruntime-web",
+    "version": "1.31.1",
+    "license": "MIT",
+    "upstream": "https://github.com/microsoft/onnxruntime",
+    "files": {
+      "ort.webgpu.min.js": {
+        "url": "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/ort.webgpu.min.js",
+        "sha256": "03f4423bd12fdbf5eb4ffcf6c1a3c471c760e10c2a1533f1ca64f5a7619c7731",
+        "size": 70811,
+        "content_type": "application/javascript; charset=utf-8"
+      },
+      "ort-wasm-simd-threaded.mjs": {
+        "url": "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/ort-wasm-simd-threaded.mjs",
+        "sha256": "30ed0b5cd1182ede931fea448afb567d4dc705ec957af09f108a2be5f770dac3",
+        "size": 24738,
+        "content_type": "application/javascript; charset=utf-8"
+      },
+      "ort-wasm-simd-threaded.wasm": {
+        "url": "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/ort-wasm-simd-threaded.wasm",
+        "sha256": "4b884c203b0fa48d057be3332c65513ff85aa3c5bddd6946acc0fab7ecda001d",
+        "size": 14848852,
+        "content_type": "application/wasm"
+      },
+      "ort-wasm-simd-threaded.jsep.mjs": {
+        "url": "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/ort-wasm-simd-threaded.jsep.mjs",
+        "sha256": "7838b4b2e77d6f1a739cd0de800e7f18a089328b365e6af4d416a88a94fd7fd3",
+        "size": 47250,
+        "content_type": "application/javascript; charset=utf-8"
+      },
+      "ort-wasm-simd-threaded.jsep.wasm": {
+        "url": "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/ort-wasm-simd-threaded.jsep.wasm",
+        "sha256": "5ab8361783822d02a57d1e97cf2514bceb451a628f2b29ae0d7b6e618201ff8f",
+        "size": 29520971,
+        "content_type": "application/wasm"
+      },
+      "ort-wasm-simd-threaded.asyncify.mjs": {
+        "url": "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/ort-wasm-simd-threaded.asyncify.mjs",
+        "sha256": "59cf781530e1a16df2a291d78798e3ec1152467edaec402d6f9599d85047c302",
+        "size": 53457,
+        "content_type": "application/javascript; charset=utf-8"
+      },
+      "ort-wasm-simd-threaded.asyncify.wasm": {
+        "url": "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/ort-wasm-simd-threaded.asyncify.wasm",
+        "sha256": "ca319e9539cd0f1e291cf56074760121eaf39650f5dbf84b6e52c07f4b2944ec",
+        "size": 28747738,
+        "content_type": "application/wasm"
+      },
+      "ort-wasm-simd-threaded.jspi.mjs": {
+        "url": "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/ort-wasm-simd-threaded.jspi.mjs",
+        "sha256": "eeb051cdbdb9f6edd8992cb4f81ad3c94ad01e4d8f767ffb415143e8afc41fc5",
+        "size": 51321,
+        "content_type": "application/javascript; charset=utf-8"
+      },
+      "ort-wasm-simd-threaded.jspi.wasm": {
+        "url": "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/ort-wasm-simd-threaded.jspi.wasm",
+        "sha256": "b89a3efceeb6df2ba29a66fef59f48fd7b7c22a62af54c3cfe05e63863a07fd5",
+        "size": 17920659,
+        "content_type": "application/wasm"
+      }
+    }
+  },
+  "models": {
+    "fast": {
+      "id": "fast",
+      "task": "cutout",
+      "display_name": "U2-NetP (320x320, fast)",
+      "filename": "u2netp.onnx",
+      "url": "https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2netp.onnx",
+      "revision": "danielgatis/rembg@v0.0.0",
+      "sha256": "309c8469258dda742793dce0ebea8e6dd393174f89934733ecc8b14c76f4ddd8",
+      "size": 4574861,
+      "license": "Apache-2.0",
+      "upstream": "https://github.com/xuebinqin/U-2-Net",
+      "status": "stable",
+      "input_name": "input.1",
+      "output_name": "1959",
+      "input_shape": [1, 3, 320, 320],
+      "input_size": [320, 320],
+      "mean": [0.485, 0.456, 0.406],
+      "std": [0.229, 0.224, 0.225],
+      "postprocess": "min_max"
+    },
+    "balanced": {
+      "id": "balanced",
+      "task": "cutout",
+      "display_name": "IS-Net General Use (1024x1024, balanced)",
+      "filename": "isnet-general-use.onnx",
+      "url": "https://github.com/danielgatis/rembg/releases/download/v0.0.0/isnet-general-use.onnx",
+      "revision": "danielgatis/rembg@v0.0.0",
+      "sha256": "60920e99c45464f2ba57bee2ad08c919a52bbf852739e96947fbb4358c0d964a",
+      "size": 178648008,
+      "license": "Apache-2.0 (see THIRD_PARTY_NOTICES.md for DIS5K dataset terms)",
+      "upstream": "https://github.com/xuebinqin/DIS",
+      "status": "stable",
+      "input_name": "input_image",
+      "output_name": "output_image",
+      "input_shape": [1, 3, 1024, 1024],
+      "input_size": [1024, 1024],
+      "mean": [0.5, 0.5, 0.5],
+      "std": [1.0, 1.0, 1.0],
+      "postprocess": "min_max"
+    },
+    "best": {
+      "id": "best",
+      "task": "cutout",
+      "display_name": "BiRefNet Lite (1024x1024, best)",
+      "filename": "birefnet-lite.onnx",
+      "url": "https://huggingface.co/onnx-community/BiRefNet_lite-ONNX/resolve/de15b22ba131738a16dff04aab8bdf8dc32e3ac1/onnx/model.onnx",
+      "revision": "onnx-community/BiRefNet_lite-ONNX@de15b22ba131738a16dff04aab8bdf8dc32e3ac1",
+      "sha256": "5600024376f572a557870a5eb0afb1e5961636bef4e1e22132025467d0f03333",
+      "size": 224005088,
+      "license": "MIT",
+      "upstream": "https://github.com/ZhengPeng7/BiRefNet",
+      "status": "stable",
+      "input_name": "input_image",
+      "output_name": "output_image",
+      "input_shape": [1, 3, 1024, 1024],
+      "input_size": [1024, 1024],
+      "mean": [0.485, 0.456, 0.406],
+      "std": [0.229, 0.224, 0.225],
+      "postprocess": "sigmoid_min_max"
+    }
+  }
+}

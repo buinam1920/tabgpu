@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tabgpu"
+version = "0.1.0"
+description = "Borrow a LAN laptop's GPU from a Chrome tab (WebGPU) with zero installation and host CPU fallback."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+authors = [
+  { name = "tabgpu contributors" }
+]
+keywords = ["webgpu", "onnx", "onnxruntime", "background-removal", "cutout", "lan", "gpu", "cli"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Intended Audience :: End Users/Desktop",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Multimedia :: Graphics",
+  "Topic :: Scientific/Engineering :: Image Processing",
+]
+dependencies = [
+  "cryptography>=42.0",
+  "numpy>=1.26",
+  "onnxruntime>=1.17",
+  "pillow>=10.2",
+  "platformdirs>=4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+
+[project.scripts]
+tabgpu = "tabgpu.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/tabgpu/tabgpu"
+Issues = "https://github.com/tabgpu/tabgpu/issues"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+tabgpu = [
+  "assets_manifest.json",
+  "web/*",
+  "web/tasks/*",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
